@@ -1,0 +1,4 @@
+requests
+redis
+beautifulsoup4
+urllib3
