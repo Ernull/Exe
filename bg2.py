@@ -122,7 +122,7 @@ class NexusBridgeAgent:
         return None
 
     def process_single_phone(self, phone, proxy_manager):
-        logs = [f"====== [ شروع عملیات برای: {phone} ] ======"]
+        logs = [f"====== [ شروع عملیات استخراج برای: {phone} ] ======"]
         proxy_url = proxy_manager.get_proxy()
         
         if not proxy_url:
@@ -156,68 +156,40 @@ class NexusBridgeAgent:
             logs.append(f"▶️ GET Auth URL | Status: {res.status_code}")
             
             if res.status_code == 403:
-                logs.append(f"❌ مسدود شدن پروکسی (403)\nHeaders: {dict(res.headers)}")
                 return phone, "error", "مسدود شدن پروکسی توسط دیجی‌کالا (403)", "\n".join(logs)
 
             soup = BeautifulSoup(res.text, 'html.parser')
             form = soup.find('form')
             
             if not form: 
-                logs.append(f"❌ فرم ورود یافت نشد.\nResponse Snippet: {res.text[:300]}")
                 return phone, "error", "فرم ورود یافت نشد", "\n".join(logs)
                 
             action_url = form.get('action')
-            logs.append(f"▶️ POST Phone -> {action_url.split('?')[0]}")
-
             res = session.post(action_url, data={"username": phone, "rememberMe": "on"}, timeout=15)
             logs.append(f"◀️ POST Phone Response | Status: {res.status_code}")
             soup = BeautifulSoup(res.text, 'html.parser')
 
-            # ----------------- بخش اصلاح شده: مکانیزم هوشمند دور زدن فرم رمز عبور -----------------
             if soup.find('input', {'name': 'password'}) or soup.find('input', {'type': 'password'}):
-                logs.append("⚠️ درخواست رمز عبور مشاهده شد. استخراج توکن مخفی برای سوئیچ به پیامک...")
-                
-                # پیدا کردن مقدار مخفی execution دیجی کالا در صفحه
                 otp_exec_input = soup.find('input', {'id': 'otp-auth-execution'})
-                
                 if otp_exec_input and otp_exec_input.has_attr('value'):
                     exec_value = otp_exec_input['value']
-                    
                     form_login = soup.find('form', {'id': 'dk-form-login'})
                     form_action = form_login.get('action') if form_login else action_url
-                    
-                    logs.append(f"▶️ POST OTP Switch (Execution: {exec_value})")
-                    
-                    # ارسال درخواست POST مشابه مرورگر کاربر واقعی
-                    res = session.post(
-                        form_action, 
-                        data={"authenticationExecution": exec_value}, 
-                        timeout=15
-                    )
-                    logs.append(f"◀️ پاسخ سوئیچ به پیامک | Status: {res.status_code}")
+                    res = session.post(form_action, data={"authenticationExecution": exec_value}, timeout=15)
                     soup = BeautifulSoup(res.text, 'html.parser')
                 else:
-                    logs.append("❌ مقدار otp-auth-execution در صفحه پیدا نشد. فرمت دیجی‌کالا تغییر کرده است.")
                     return phone, "error", "خطای ساختار فرم رمز", "\n".join(logs)
-            # -----------------------------------------------------------------------------
 
             form_otp = soup.find('form')
             if not form_otp: 
-                logs.append(f"❌ فرم پیامک یافت نشد.\nResponse Snippet: {res.text[:300]}")
                 return phone, "error", "فرم پیامک یافت نشد", "\n".join(logs)
                 
             otp_action_url = form_otp.get('action')
-            logs.append("⏳ در حال انتظار برای دریافت پیامک تایید (Max: 50s)...")
-
             code = self.wait_for_sms(phone, timeout=50)
             if not code: 
-                logs.append("❌ تایم‌اوت: هیچ پیامکی دریافت نشد.")
                 return phone, "error", "تایم‌اوت پیامک", "\n".join(logs)
 
-            logs.append(f"💬 کد پیامک با موفقیت دریافت شد: {code}")
-            
             res = session.post(otp_action_url, data={"code": code}, allow_redirects=False, timeout=15)
-            logs.append(f"▶️ POST OTP Code | Status: {res.status_code}")
 
             auth_code = None
             if 'Location' in res.headers:
@@ -228,10 +200,8 @@ class NexusBridgeAgent:
                 if cmatch: auth_code = cmatch.group(1)
 
             if not auth_code: 
-                logs.append(f"❌ کد تایید اشتباه است یا منقضی شده.\nLocation Header: {res.headers.get('Location', 'N/A')}")
                 return phone, "error", "کد تایید اشتباه است", "\n".join(logs)
 
-            logs.append("▶️ استخراج توکن‌های امنیتی (Auth Exchange)...")
             token_data = {
                 "code": auth_code,
                 "grant_type": "authorization_code",
@@ -240,7 +210,6 @@ class NexusBridgeAgent:
                 "code_verifier": verifier
             }
             res_token = session.post("https://auth.digikala.com/realms/dk-group/protocol/openid-connect/token", data=token_data, timeout=15)
-            logs.append(f"◀️ POST Token Response | Status: {res_token.status_code}")
 
             if res_token.status_code == 200:
                 tokens = res_token.json()
@@ -268,26 +237,138 @@ class NexusBridgeAgent:
                     }
                     extension_cookies.append(cookie_data)
 
-                final_json = {
-                    "cookies": extension_cookies,
-                    "origins": [] 
-                }
-                
-                name = "کاربر دیجی‌کالا" 
-                payload = {"phone": phone, "name": name, "data": final_json}
+                final_json = {"cookies": extension_cookies, "origins": []}
+                payload = {"phone": phone, "name": "کاربر دیجی‌کالا", "data": final_json}
                 self.db.rpush("bot:new_accounts", json.dumps(payload, ensure_ascii=False))
                 self.db.sadd("jet:processed_phones", phone)
-                
-                logs.append("✅ عملیات لاگین و ذخیره‌سازی نشست با موفقیت به اتمام رسید.")
-                return phone, "success", name, "\n".join(logs)
-
+                return phone, "success", "کاربر دیجی‌کالا", "\n".join(logs)
             else:
-                logs.append(f"❌ خطا در ساخت توکن.\nResponse: {res_token.text}")
                 return phone, "error", "خطا در دریافت توکن", "\n".join(logs)
 
         except Exception as e:
-            logs.append(f"❌ خطای پیش‌بینی نشده (Exception): {str(e)}")
             return phone, "error", str(e)[:30], "\n".join(logs)
+
+    # ------------------ سیستم جدید چکر سوابق خرید ------------------
+    def process_single_check(self, phone, acc_data, proxy_manager):
+        proxy_url = proxy_manager.get_proxy()
+        
+        # استخراج توکن از دیتا
+        dk_token = None
+        for cookie in acc_data.get("data", {}).get("cookies", []):
+            if cookie.get("name") == "Digikala:User:Token:v2":
+                dk_token = cookie.get("value")
+                break
+                
+        if not dk_token:
+            return phone, 0, "NO_TOKEN_IN_DATA"
+
+        session = requests.Session()
+        if proxy_url:
+            session.proxies = {"http": proxy_url, "https": proxy_url}
+            
+        sa_headers = {
+            "x-web-client": "desktop", "x-web-client-id": "web", "x-web-optimize-response": "1",
+            "Referer": "https://www.digikala.com/",
+            "Authorization": f"Bearer {dk_token}" if not dk_token.startswith("Bearer") else dk_token,
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+
+        try:
+            res_sa = session.get("https://api.digikala.com/super-app/v1/sso/jet/", params={"redirect_url": "/?utm_source=digikala-superweb"}, headers=sa_headers, allow_redirects=False, timeout=15, verify=False)
+            sa_token = None
+            if 'Location' in res_sa.headers:
+                match = re.search(r'sa_token=([^&]+)', res_sa.headers['Location'])
+                if match: sa_token = match.group(1)
+
+            if not sa_token:
+                res_sa_redirect = session.get("https://api.digikala.com/super-app/v1/sso/jet/", params={"redirect_url": "/?utm_source=digikala-superweb"}, headers=sa_headers, allow_redirects=True, timeout=15, verify=False)
+                parsed = urllib.parse.urlparse(res_sa_redirect.url)
+                qs = urllib.parse.parse_qs(parsed.query)
+                if 'sa_token' in qs: sa_token = qs['sa_token'][0]
+
+            if not sa_token: return phone, 0, "SA_TOKEN_FAILED"
+
+            jet_headers = {
+                'authority': 'api.digikalajet.ir', 'accept': 'application/json, text/plain, */*',
+                'app-id': '470de285-a905-462b-b967-53ce8eced716', 'client': 'mobile',
+                'clientid': 'FINGERPRINTV2-' + uuid.uuid4().hex, 'clientos': 'Android',
+                'content-type': 'application/json', 'origin': 'https://www.digikalajet.com',
+                'user-agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 Chrome/137.0.0.0 Mobile'
+            }
+
+            res_jet = session.post("https://api.digikalajet.ir/super-app-sso/", headers=jet_headers, json={"dsa_token": sa_token}, timeout=15, verify=False)
+            if res_jet.status_code != 200: return phone, 0, f"JET_SSO_FAILED_{res_jet.status_code}"
+
+            jet_token = res_jet.json().get('data', {}).get('token')
+            if not jet_token: return phone, 0, "NO_JET_TOKEN"
+
+            jet_headers['Authorization'] = jet_token
+            jet_headers['session'] = f"{uuid.uuid4()}-V3*{int(time.time())}"
+
+            res_orders = session.get("https://api.digikalajet.ir/order-shipments/?ch=jj", headers=jet_headers, timeout=15, verify=False)
+            if res_orders.status_code == 200:
+                res_json = res_orders.json()
+                if res_json.get("status") == 200:
+                    data_obj = res_json.get("data", {})
+                    pager_total = data_obj.get("pager", {}).get("total_items", 0)
+                    orders_obj = data_obj.get("orders", {})
+                    ongoing = len(orders_obj.get("ongoing", []) or [])
+                    accomplished = len(orders_obj.get("accomplished", []) or [])
+                    total_orders = max(pager_total, ongoing + accomplished)
+                    
+                    # ثبت نتیجه در دیتابیس
+                    acc_data["total_orders"] = total_orders
+                    if total_orders > 0:
+                        self.db.hset("jet:ordered_accounts", phone, json.dumps(acc_data, ensure_ascii=False))
+                    else:
+                        self.db.hset("jet:clean_accounts", phone, json.dumps(acc_data, ensure_ascii=False))
+                    
+                    self.db.hdel("jet:bulk_accounts", phone)
+                    return phone, total_orders, "SUCCESS"
+                else: return phone, 0, f"API_ERR_{res_json.get('status')}"
+            else: return phone, 0, f"HTTP_{res_orders.status_code}"
+                
+        except Exception as e:
+            return phone, 0, "TIMEOUT_OR_PROXY_ERR"
+
+    def run_checker(self):
+        proxies = self.get_active_proxies()
+        raw_accounts = self.db.hgetall("jet:bulk_accounts")
+        
+        if not proxies:
+            self.send_alert_to_admin("❌ توقف چکر: هیچ پروکسی فعالی یافت نشد.")
+            return
+        if not raw_accounts:
+            self.send_alert_to_admin("❌ توقف چکر: اکانتی برای بررسی وجود ندارد.")
+            return
+
+        target_accounts = list(raw_accounts.items())
+        capacity = len(proxies) * 4
+        
+        start_msg = f"🔎 **شروع چکر خریدها:**\nتعداد اکانت: {len(target_accounts)}\nپروکسی‌های فعال: {len(proxies)} (ظرفیت: {capacity})\n⏳ در حال بررسی (با استفاده از پروکسی‌های ثبت‌نام)..."
+        print(start_msg)
+        self.send_alert_to_admin(start_msg)
+
+        pm = ProxyManager(proxies)
+        ordered_count, clean_count, err_count = 0, 0, 0
+        
+        with ThreadPoolExecutor(max_workers=min(len(proxies), 20)) as executor:
+            futures = []
+            for phone, acc_raw in target_accounts:
+                acc_data = json.loads(acc_raw)
+                futures.append(executor.submit(self.process_single_check, phone, acc_data, pm))
+
+            for future in as_completed(futures):
+                phone, order_count, status = future.result()
+                if status == "SUCCESS":
+                    if order_count > 0: ordered_count += 1
+                    else: clean_count += 1
+                else:
+                    err_count += 1
+
+        end_msg = f"📊 **گزارش نهایی چکر:**\n⭐ دارای خرید: {ordered_count}\n⚪ بدون خرید (خام): {clean_count}\n❌ ارورها: {err_count}\n\nبررسی به اتمام رسید."
+        print("\n" + end_msg)
+        self.send_alert_to_admin(end_msg)
 
     def run_bulk(self):
         proxies = self.get_active_proxies()
@@ -312,7 +393,7 @@ class NexusBridgeAgent:
             self.send_alert_to_admin(f"⛔️ **توقف سیستم (کمبود پروکسی)**\nشماره‌ها: {len(target_phones)}\nظرفیت پروکسی: {capacity}\n\nلطفاً تعداد پروکسی را افزایش دهید.")
             return
 
-        start_report = f"🚀 **گزارش شروع عملیات دیجی‌کالا:**\nتعداد پروکسی: {len(proxies)} (ظرفیت: {capacity}) | شماره‌ها: {len(target_phones)}\n⏳ در حال پردازش..."
+        start_report = f"🚀 **گزارش شروع عملیات استخراج:**\nتعداد پروکسی: {len(proxies)} (ظرفیت: {capacity}) | شماره‌ها: {len(target_phones)}\n⏳ در حال پردازش..."
         print(start_report)
         self.send_alert_to_admin(start_report)
 
@@ -330,7 +411,7 @@ class NexusBridgeAgent:
                 else:
                     error_count += 1
 
-        end_report = f"📊 **گزارش نهایی سیستم دیجی‌کالا:**\n✅ موفق: {success_count}\n❌ ارورها: {error_count}\n\nعملیات با موفقیت به اتمام رسید."
+        end_report = f"📊 **گزارش نهایی استخراج:**\n✅ موفق: {success_count}\n❌ ارورها: {error_count}\n\nعملیات با موفقیت به اتمام رسید."
         print("\n" + end_report)
         self.send_alert_to_admin(end_report)
         
@@ -340,12 +421,16 @@ class NexusBridgeAgent:
             self.send_file_to_admin(filename, file_content)
 
     def run(self):
-        print("🟢 Listening for ADMIN BULK RUN command for Digikala...")
+        print("🟢 Listening for ADMIN COMMANDS...")
         while True:
             try:
                 task = self.db.blpop("bot:admin_commands", timeout=5)
-                if task and task[1] == "START_BULK":
-                    self.run_bulk()
+                if task:
+                    cmd = task[1]
+                    if cmd == "START_BULK":
+                        self.run_bulk()
+                    elif cmd == "START_CHECKER":
+                        self.run_checker()
             except Exception:
                 time.sleep(2)
 
